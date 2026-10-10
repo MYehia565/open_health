@@ -447,7 +447,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             // If it has not, fail explicitly rather than retrying the same operation.
             dlog("ble", "subscribe FAILED on …\(shortUUID): \(error)")
             if nsError.domain == CBATTErrorDomain, nsError.code == 15 {
-                dlog("ble", "link encryption is still insufficient after retry; check iOS Bluetooth pairing/bond state")
+                dlog("ble", "link encryption is still insufficient after the protected-write bootstrap; check iOS Bluetooth pairing/bond state")
                 return finishConnect(.failure(BLEError.encryptionInsufficient(characteristic: shortUUID)))
             }
             return finishConnect(.failure(error))
