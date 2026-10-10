@@ -99,9 +99,13 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     private var writeCont: CheckedContinuation<Void, Error>?
     private var connectTimeout: DispatchWorkItem?
     private var pendingNotify = 0 // notify subscriptions still awaiting confirmation
-    // A protected characteristic can reject the first subscription while CoreBluetooth
-    // negotiates link encryption/bonding. Retry each characteristic once; never loop.
-    private var securityRetryChars = Set<String>()
+    private var notifyCharsForSubscription: [CBCharacteristic] = []
+    // The ring requires BLE link encryption before notification subscription. Initiate
+    // CoreBluetooth's security/bonding flow with a protected GATT read first; only
+    // subscribe after that operation succeeds.
+    private var securityBootstrapPending = false
+    private var securityBootstrapAttempts = 0
+    private let maxSecurityBootstrapAttempts = 3
     private var poweredOn = false
     // where the in-flight connect currently is, for the timeout error message.
     private var stage = "waiting for Bluetooth to power on"
@@ -406,14 +410,36 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             dlog("ble", "no notify characteristics (98ED0003..0006)")
             return finishConnect(.failure(BLEError.notFound))
         }
+        // open_oura's desktop transport relies on the OS to bond during the first
+        // protected GATT operation. On iOS, don't start by subscribing: error 15 can
+        // arrive before CoreBluetooth has completed the pairing flow. First read the
+        // ring's read/notify characteristic to trigger link-security negotiation;
+        // only begin subscriptions after that protected access succeeds.
+        guard let securityChar = notifyChars.first(where: {
+            $0.uuid == CBUUID(string: "98ED0003-A541-11E4-B6A0-0002A5D5C51B")
+                && $0.properties.contains(.read)
+        }) else {
+            dlog("ble", "no readable 98ED0003 characteristic to initiate BLE link security")
+            return finishConnect(.failure(BLEError.notFound))
+        }
+        notifyCharsForSubscription = notifyChars
+        securityBootstrapPending = true
+        securityBootstrapAttempts = 1
+        lock.lock(); stage = "initiating BLE link encryption/bonding"; lock.unlock()
+        dlog("ble", "initiating CoreBluetooth link-security negotiation via protected read on …0003")
+        peripheral.readValue(for: securityChar)
+    }
+
+    private func beginNotifySubscriptions() {
+        guard !closed, let peripheral else { return }
         // don't report "connected" until every notify subscription is confirmed —
         // otherwise Rust can start syncing before inbound frames flow and miss the
-        // ring's early responses. didUpdateNotificationStateFor finishes the connect.
+        // ring's early responses.
         lock.lock()
-        pendingNotify = notifyChars.count
-        stage = "subscribing to notify characteristics"
+        pendingNotify = notifyCharsForSubscription.count
+        stage = "subscribing to notify characteristics after link security"
         lock.unlock()
-        for c in notifyChars { peripheral.setNotifyValue(true, for: c) }
+        for c in notifyCharsForSubscription { peripheral.setNotifyValue(true, for: c) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
@@ -423,25 +449,8 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             let uuid = characteristic.uuid.uuidString.uppercased()
             let shortUUID = String(characteristic.uuid.uuidString.prefix(8)).lowercased()
             let nsError = error as NSError
-            // Gen3 firmware may require an encrypted BLE link before notifications can
-            // be enabled. CoreBluetooth owns the pairing/bonding exchange; the app must
-            // not attempt to bypass it. A single delayed retry gives the OS time to
-            // complete any in-flight security negotiation without creating a retry loop.
-            if nsError.domain == CBATTErrorDomain,
-               nsError.code == 15,
-               !securityRetryChars.contains(uuid) {
-                securityRetryChars.insert(uuid)
-                dlog("ble", "subscribe requires link encryption on …\(shortUUID); retrying once after security negotiation")
-                bleQueue.asyncAfter(deadline: .now() + 2.0) { [weak self, weak peripheral] in
-                    guard let self, let peripheral,
-                          !self.closed, self.peripheral === peripheral,
-                          let current = peripheral.services?
-                            .flatMap({ $0.characteristics ?? [] })
-                            .first(where: { $0.uuid == characteristic.uuid }) else { return }
-                    peripheral.setNotifyValue(true, for: current)
-                }
-                return
-            }
+            // Security negotiation should already have completed before subscriptions.
+            // If it has not, fail explicitly rather than retrying the same operation.
             dlog("ble", "subscribe FAILED on …\(shortUUID): \(error)")
             if nsError.domain == CBATTErrorDomain, nsError.code == 15 {
                 dlog("ble", "link encryption is still insufficient after retry; check iOS Bluetooth pairing/bond state")
@@ -460,6 +469,39 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard !closed, self.peripheral === peripheral else { return }
+
+        // This read is a deliberate security bootstrap, not a protocol response.
+        // An initial insufficient-encryption error is the signal that CoreBluetooth
+        // needs to negotiate a bond. After the system pairing flow, retry the protected
+        // read a bounded number of times; once it succeeds, subscribe to notifications.
+        if securityBootstrapPending,
+           characteristic.uuid == CBUUID(string: "98ED0003-A541-11E4-B6A0-0002A5D5C51B") {
+            if let error {
+                let nsError = error as NSError
+                if nsError.domain == CBATTErrorDomain, nsError.code == 15,
+                   securityBootstrapAttempts < maxSecurityBootstrapAttempts {
+                    securityBootstrapAttempts += 1
+                    let attempt = securityBootstrapAttempts
+                    dlog("ble", "protected read requires link encryption; waiting for iOS pairing/security negotiation (attempt \(attempt)/\(maxSecurityBootstrapAttempts))")
+                    bleQueue.asyncAfter(deadline: .now() + 2.0) { [weak self, weak peripheral] in
+                        guard let self, let peripheral, !self.closed,
+                              self.peripheral === peripheral, self.securityBootstrapPending,
+                              let c = peripheral.services?.flatMap({ $0.characteristics ?? [] })
+                                .first(where: { $0.uuid == characteristic.uuid }) else { return }
+                        peripheral.readValue(for: c)
+                    }
+                    return
+                }
+                securityBootstrapPending = false
+                dlog("ble", "BLE security bootstrap FAILED: \(error)")
+                return finishConnect(.failure(error))
+            }
+            securityBootstrapPending = false
+            dlog("ble", "protected read succeeded; link security is available, subscribing to notify characteristics")
+            beginNotifySubscriptions()
+            return // never forward the bootstrap read as a protocol response
+        }
+
         // drop the callback on a read/notify error — a stale payload must not be fed
         // into the frame stream Rust drains as protocol responses.
         guard error == nil, let v = characteristic.value else {
