@@ -35,6 +35,7 @@ protocol RingTransport: AnyObject {
 enum BLEError: Error, CustomStringConvertible {
     case poweredOff, notFound, noWriteCharacteristic, disconnected, busy
     case ringNotAdvertising(otherDevices: Int)
+    case encryptionInsufficient(characteristic: String)
     /// carries the stage the attempt was in, so "timed out" says *what* never happened
     /// (no advertisement seen vs GATT connect stalled vs subscriptions pending).
     case timedOut(stage: String)
@@ -42,6 +43,8 @@ enum BLEError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .ringNotAdvertising(let count): return "no ring advertisement found (\(count) other Bluetooth devices detected)"
+        case .encryptionInsufficient(let characteristic):
+            return "ring requires an encrypted Bluetooth connection (characteristic …\(characteristic)); accept any iOS Bluetooth pairing prompt and retry"
         case .poweredOff: return "Bluetooth is off or not authorized"
         case .notFound: return "ring service/characteristics not found"
         case .noWriteCharacteristic: return "no write characteristic (98ED0002)"
@@ -442,6 +445,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             dlog("ble", "subscribe FAILED on …\(shortUUID): \(error)")
             if nsError.domain == CBATTErrorDomain, nsError.code == 15 {
                 dlog("ble", "link encryption is still insufficient after retry; check iOS Bluetooth pairing/bond state")
+                return finishConnect(.failure(BLEError.encryptionInsufficient(characteristic: shortUUID)))
             }
             return finishConnect(.failure(error))
         }
