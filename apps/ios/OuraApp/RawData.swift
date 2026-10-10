@@ -76,7 +76,11 @@ enum RawData {
     /// The type list alone (no filter) asks for no rows, so the core skips the
     /// history-wide clock scan that only the event list needs.
     static func load(filter: String, limit: UInt32 = 400) -> Page {
-        let raw = eventsJson(dbPath: DB.url.path, nameFilter: filter, limit: filter.isEmpty ? 0 : limit)
+        let dbPath = DB.readPath()
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            return Page(kinds: [], events: [], fields: [], error: nil)
+        }
+        let raw = eventsJson(dbPath: dbPath, nameFilter: filter, limit: filter.isEmpty ? 0 : limit)
         guard let data = raw.data(using: .utf8),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return Page(kinds: [], events: [], fields: [], error: "unreadable response") }
