@@ -96,6 +96,9 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     private var writeCont: CheckedContinuation<Void, Error>?
     private var connectTimeout: DispatchWorkItem?
     private var pendingNotify = 0 // notify subscriptions still awaiting confirmation
+    // A protected characteristic can reject the first subscription while CoreBluetooth
+    // negotiates link encryption/bonding. Retry each characteristic once; never loop.
+    private var securityRetryChars = Set<String>()
     private var poweredOn = false
     // where the in-flight connect currently is, for the timeout error message.
     private var stage = "waiting for Bluetooth to power on"
@@ -414,9 +417,32 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
                     error: Error?) {
         guard !closed, self.peripheral === peripheral else { return }
         if let error {
-            // a pairing/encryption demand surfaces here (e.g. "Authentication is
-            // insufficient") — the single most diagnostic error on a keyed ring.
-            dlog("ble", "subscribe FAILED on …\(characteristic.uuid.uuidString.prefix(8).lowercased()): \(error)")
+            let uuid = characteristic.uuid.uuidString.uppercased()
+            let shortUUID = String(characteristic.uuid.uuidString.prefix(8)).lowercased()
+            let nsError = error as NSError
+            // Gen3 firmware may require an encrypted BLE link before notifications can
+            // be enabled. CoreBluetooth owns the pairing/bonding exchange; the app must
+            // not attempt to bypass it. A single delayed retry gives the OS time to
+            // complete any in-flight security negotiation without creating a retry loop.
+            if nsError.domain == CBATTErrorDomain,
+               nsError.code == 15,
+               !securityRetryChars.contains(uuid) {
+                securityRetryChars.insert(uuid)
+                dlog("ble", "subscribe requires link encryption on …\(shortUUID); retrying once after security negotiation")
+                bleQueue.asyncAfter(deadline: .now() + 2.0) { [weak self, weak peripheral] in
+                    guard let self, let peripheral,
+                          !self.closed, self.peripheral === peripheral,
+                          let current = peripheral.services?
+                            .flatMap({ $0.characteristics ?? [] })
+                            .first(where: { $0.uuid == characteristic.uuid }) else { return }
+                    peripheral.setNotifyValue(true, for: current)
+                }
+                return
+            }
+            dlog("ble", "subscribe FAILED on …\(shortUUID): \(error)")
+            if nsError.domain == CBATTErrorDomain, nsError.code == 15 {
+                dlog("ble", "link encryption is still insufficient after retry; check iOS Bluetooth pairing/bond state")
+            }
             return finishConnect(.failure(error))
         }
         dlog("ble", "subscribed …\(characteristic.uuid.uuidString.prefix(8).lowercased())")
